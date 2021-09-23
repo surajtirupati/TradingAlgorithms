@@ -1,10 +1,12 @@
 class SMAX(QCAlgorithm):
-    '''In this example we look at the canonical 15/30 day moving average cross. This algorithm
-    will go long when the 15 crosses above the 30 and will liquidate when the 15 crosses
-    back below the 30.'''
+    '''In this code we setup a simple moving average crossover strategy. We define the long term moving average (ltma) and short term
+    moving avergae (stma) in the __init__() function. '''
 
     def __init__(self):
         self.symbol = "BTCUSD"
+        self.ltma = 84
+        self.stma = 7
+        self.cash = 10000
         self.previous = None
         self.fast = None
         self.slow = None
@@ -13,7 +15,7 @@ class SMAX(QCAlgorithm):
         '''Initialise the data and resolution required, as well as the cash and start-end dates for your algorithm. All algorithms must initialized.'''
 
         # Set Strategy Cash - this is ignored when trading live
-        self.SetCash(10000)
+        self.SetCash(self.cash)
 
         # Set Backtest start date - this is ignored when trading live
         self.SetStartDate(2015, 2, 1)
@@ -22,12 +24,13 @@ class SMAX(QCAlgorithm):
         self.AddSecurity(SecurityType.Crypto, self.symbol, Resolution.Daily)
 
         # create a 15 day exponential moving average
-        self.fast = self.SMA(self.symbol, 7, Resolution.Daily)
+        self.fast = self.SMA(self.symbol, self.stma, Resolution.Daily)
 
         # create a 30 day exponential moving average
-        self.slow = self.SMA(self.symbol, 84, Resolution.Daily)
+        self.slow = self.SMA(self.symbol, self.ltma, Resolution.Daily)
 
-        self.SetWarmUp(timedelta(days=84))
+        # warmup period equal to the ltma
+        self.SetWarmUp(timedelta(days=self.ltma))
 
     def OnData(self, data):
         '''OnData event is the primary entry point for your algorithm. Each new data point will be pumped in here.
