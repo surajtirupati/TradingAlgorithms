@@ -3,8 +3,8 @@ class SMAX(QCAlgorithm):
     will go long when the 15 crosses above the 30 and will liquidate when the 15 crosses
     back below the 30.'''
 
-    def __init__(self, symbol, stma, ltma, cash):
-        self.symbol = symbol
+    def __init__(self):
+        self.symbol = "BTCUSD"
         self.previous = None
         self.fast = None
         self.slow = None
@@ -13,19 +13,21 @@ class SMAX(QCAlgorithm):
         '''Initialise the data and resolution required, as well as the cash and start-end dates for your algorithm. All algorithms must initialized.'''
 
         # Set Strategy Cash - this is ignored when trading live
-        self.SetCash(cash)
+        self.SetCash(10000)
 
         # Set Backtest start date - this is ignored when trading live
-        self.SetStartDate(2013, 1, 1)
+        self.SetStartDate(2015, 2, 1)
 
         # Find more symbols here: http://quantconnect.com/data
-        self.AddSecurity(SecurityType.Crypto, self.symbol, Resolution.Minute)
+        self.AddSecurity(SecurityType.Crypto, self.symbol, Resolution.Daily)
 
         # create a 15 day exponential moving average
-        self.fast = self.SMA(self.symbol, stma, Resolution.Daily);
+        self.fast = self.SMA(self.symbol, 7, Resolution.Daily)
 
         # create a 30 day exponential moving average
-        self.slow = self.SMA(self.symbol, ltma, Resolution.Daily);
+        self.slow = self.SMA(self.symbol, 84, Resolution.Daily)
+
+        self.SetWarmUp(timedelta(days=84))
 
     def OnData(self, data):
         '''OnData event is the primary entry point for your algorithm. Each new data point will be pumped in here.
@@ -38,14 +40,8 @@ class SMAX(QCAlgorithm):
         #  2. We can use indicators directly in math expressions
         #  3. We can easily plot many indicators at the same time
 
-        units = np.floor(cash / self.Securities[self.symbol].Price)
-
-        # wait for our slow ema to fully initialize
-        if not self.slow.IsReady:
-            return
-
-            # only once per day
-        if self.previous is not None and self.previous.Date == self.Time.Date:
+        # only once per day
+        if self.previous is not None and self.previous == self.Time:
             return
 
         # define a small tolerance on our checks to avoid bouncing
@@ -56,7 +52,7 @@ class SMAX(QCAlgorithm):
         # we only want to go long if we're currently short or flat
         if holdings <= 0:
             # if the fast is greater than the slow, we'll go long
-            if self.fast.Current.Value > self.slow.Current.Value * Decimal(1 + tolerance):
+            if self.fast.Current.Value > self.slow.Current.Value * (1 + tolerance):
                 self.Log("BUY  >> {0}".format(self.Securities[self.symbol].Price))
                 self.SetHoldings(self.symbol, 1.0)
 
@@ -67,3 +63,4 @@ class SMAX(QCAlgorithm):
             self.Liquidate(self.symbol)
 
         self.previous = self.Time
+
