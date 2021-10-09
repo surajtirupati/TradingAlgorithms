@@ -1,11 +1,14 @@
 from abc import ABC, abstractmethod
 import pandas as pd
 import numpy as np
+import yfinance as yf
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 from scipy.ndimage.interpolation import shift
+from scipy.stats import laplace
 import scipy.stats as stats
 import warnings
+
 warnings.filterwarnings("ignore")
 
 
@@ -17,7 +20,6 @@ class Backtest_Environment(ABC):
 
     - process()
     - monitorPosition()
-    - backtest()
 
     The first two contain the entry and exit rules/conditions of the strategy respectively. process() should return the number
     of units to purchase given favourable conditions for creating a position while monitorPosition returns a boolean on whether
@@ -27,7 +29,7 @@ class Backtest_Environment(ABC):
     """
 
     def __init__(self, data, start_cash, pos_size, tc, cooldown=1, max_executions=None, max_execution_period=None,
-                 cash_buffer=0, stoploss=None):
+                 cash_buffer=0, stoploss=None, trailing_stoploss=False):
         self.data = data  # storing the data as a class variable
         self.data = self.format_data(data)  # modifying the data to include columns NDOpen and NDDate
         self.start_cash = int(start_cash)  # storing a specific variable for starting cash
@@ -45,10 +47,12 @@ class Backtest_Environment(ABC):
         self.max_executions = max_executions  # maxmium executions
         self.max_execution_period = max_execution_period  # maximum execution period
         self.stoploss = stoploss  # setting the stoploss
+        self.trailing_stoploss = trailing_stoploss  # trailing stoploss boolean
 
         # adding the stoploss to the data
         if self.stoploss is not None:
-            self.data["StopLoss"] = self.data["Close"] * (1 - self.stoploss)
+            self.data["LongStopLoss"] = self.data["Close"] * (1 - self.stoploss)
+            self.data["ShortStopLoss"] = self.data["Close"] * (1 + self.stoploss)
 
         else:
             self.data["StopLoss"] = 0
@@ -106,6 +110,7 @@ class Backtest_Environment(ABC):
 
             # checking if exection max execution period is not None
             if self.max_execution_period is not None:
+
                 # if the current day is a multiple of the max execution period, reset the executions
                 if i % self.max_execution_period == 0:
                     executions = 0
@@ -122,67 +127,56 @@ class Backtest_Environment(ABC):
 
                     # 1 TRADE INITIALISATION: if a trade is to be placed
                     if self.process(data_row) is not 0:
-
                         # incrementing executions
                         executions += 1
 
                         # obtain number of units
-                        num_units = self.process(data_row)
+                        num_units, pos_type = self.process(data_row)
 
                         # OPEN a position (market order)
                         self.openPositions.append(
-                            self.openPosition(data_row.NDOpen.values[0], num_units, data_row.NDDate.values[0],
-                                              data_row.PosTarget.values[0], data_row.StopLoss.values[0]))
+                            self.openPositionDF(i, data_row.NDOpen.values[0], num_units, data_row.NDDate.values[0],
+                                                pos_type, data_row.PosTarget.values[0],
+                                                data_row.LongStopLoss.values[0]))
+
+                        # executing the opening of the position - this function alters the self.cash_available variable
+                        self.executeOpenPosition(i, data_row, pos_type, num_units)
 
                         # set the cooldown threshold to the initialised value once a position is opened
                         cooldown = self.cooldown
 
-                        # reducing the portfolio's cash
-                        if self.tc >= 1:
-                            self.cash_available = self.cash_available - num_units * data_row.NDOpen.values[0] - self.tc
-
-                        elif self.tc < 1:
-                            self.cash_available = self.cash_available - num_units * data_row.NDOpen.values[
-                                0] - num_units * data_row.NDOpen.values[0] * self.tc
-
-            # 2 TRADE MONITORING: monitoring activate trades by
+                        # 2 TRADE MONITORING: monitoring activate trades by
             # creating a false bool that turns true when an order closes
             order_closed = False
 
             # iterating throughe each open position
             for position in self.openPositions:
 
+                # implementing the trailing stoplosses
+                position = self.adjust_trailing_stoploss(data_row, position)
+
                 # checking if exit condition is met in self.monitorPosition()
                 if self.monitorPosition(data_row, position) == True:
-
                     # update order close bool - indicating that an order has closed today
                     order_closed = True
 
                     # append the closed position to the closed Positions list
                     self.closedPositions.append(
-                        self.closePosition(position, data_row.NDOpen.values[0], data_row.NDDate.values[0]))
+                        self.closePositionDF(position, data_row.NDOpen.values[0], data_row.NDDate.values[0]))
 
                     # update the status of the open position
                     position = self.changePositionStatus(position)
 
-                    # update cash and charge transaction costs for closing position
-                    if self.tc >= 1:
-                        # need to add cash back after absolute transaction costs
-                        self.cash_available = self.cash_available + position.Units.values[0] * data_row.NDOpen.values[
-                            0] - self.tc
+                    # executing the closing of the position - this function alters the self.cash_available variable
+                    self.executeClosePosition(data_row, position)
 
-                    elif self.tc < 1:
-                        # need to add cash back after % transaction costs
-                        self.cash_available = self.cash_available + position.Units.values[0] * data_row.NDOpen.values[
-                            0] - position.Units.values[0] * data_row.NDOpen.values[0] * self.tc
-
-            # if an order(s) has closed, remove inactive orders is called
+                    # if an order(s) has closed, remove inactive orders is called
             if order_closed:
                 # self.removeInactiveOrders() removes all inactive orders and returns list of only active order
                 # result stored in self.openPositions
                 self.openPositions = self.removeInactiveOrders()
 
-            # UPDATING CASH
+                # UPDATING CASH
             self.cash_time_series = np.append(self.cash_time_series, self.updatedCash(data_row))
             self.units_held = np.append(self.units_held, self.totalUnits())
 
@@ -212,7 +206,69 @@ class Backtest_Environment(ABC):
 
         return self.data
 
-    def openPosition(self, price, units, date, target_price=None, stoploss=None):
+    def executeOpenPosition(self, i, data, pos_type, num_units):
+        """
+        This function changes the self.cash_available value upon the opening of a position by considering the order type,
+        and incorporating the relevant transaction costs. It takes the following inputs:
+
+        - i: numerical index of backtest() for loop as a unique order ID
+        - data: data_row of that current day containing all relevant market information for strategy
+        - pos_type: the type of position - a string reading either Long or Short
+        - num_units: the number of units to execute the order with
+        """
+
+        if pos_type == "Long":
+
+            # reducing the portfolio's cash for long orders
+            if self.tc >= 1:
+                self.cash_available = self.cash_available - num_units * data.NDOpen.values[0] - self.tc
+
+            elif self.tc < 1:
+                self.cash_available = self.cash_available - num_units * data.NDOpen.values[0] - num_units * \
+                                      data.NDOpen.values[0] * self.tc
+
+        elif pos_type == "Short":
+
+            # increasing the portfolio's cash for short orders
+            if self.tc >= 1:
+                self.cash_available = self.cash_available + num_units * data.NDOpen.values[0] - self.tc
+
+            elif self.tc < 1:
+                self.cash_available = self.cash_available + num_units * data.NDOpen.values[0] - num_units * \
+                                      data.NDOpen.values[0] * self.tc
+
+    def executeClosePosition(self, data, position):
+        """
+        This function changes the self.cash_available value upon the closing of a position by considering the order type,
+        and incorporating the relevant transaction costs. It takes the following inputs:
+
+        - data: data row for that day containing all the required market data
+        - position: the open position that is being closed
+        """
+
+        if position.PosType.values[0] == "Long":
+            # update cash and charge transaction costs for closing position
+            if self.tc >= 1:
+                # need to add cash back after absolute transaction costs
+                self.cash_available = self.cash_available + position.Units.values[0] * data.NDOpen.values[0] - self.tc
+
+            elif self.tc < 1:
+                # need to add cash back after % transaction costs
+                self.cash_available = self.cash_available + position.Units.values[0] * data.NDOpen.values[0] - \
+                                      position.Units.values[0] * data.NDOpen.values[0] * self.tc
+
+        elif position.PosType.values[0] == "Short":
+            # update cash and charge transaction costs for closing position
+            if self.tc >= 1:
+                # need to add cash back after absolute transaction costs
+                self.cash_available = self.cash_available - position.Units.values[0] * data.NDOpen.values[0] - self.tc
+
+            elif self.tc < 1:
+                # need to add cash back after % transaction costs
+                self.cash_available = self.cash_available - position.Units.values[0] * data.NDOpen.values[0] - \
+                                      position.Units.values[0] * data.NDOpen.values[0] * self.tc
+
+    def openPositionDF(self, pos_id, price, units, date, pos_type, target_price=None, stoploss=None):
         """
         Standardised function across strategy backtest classes that takes input of:
         - next day's Open price
@@ -226,7 +282,7 @@ class Backtest_Environment(ABC):
 
         # ORDER PARAMETERS
         status = True  # order status
-        position_id = len(self.openPositions)  # position identifier
+        position_id = pos_id  # position identifier - set to numerical date index
         num_units = units  # units of stock to buy
         entry_price = price
         entry_date = date  # date of purchase
@@ -234,10 +290,11 @@ class Backtest_Environment(ABC):
 
         # returning a pandas dataframe
         return pd.DataFrame(
-            [[status, position_id, num_units, entry_price, entry_date, target_price, stoploss, pos_val]],
-            columns=["Status", "PosID", "Units", "EntryPrice", "EntryDate", "PosTarget", "StopLoss", "PosVal"])
+            [[status, pos_type, position_id, num_units, entry_price, entry_date, target_price, stoploss, pos_val]],
+            columns=["Status", "PosType", "PosID", "Units", "EntryPrice", "EntryDate", "PosTarget", "StopLoss",
+                     "PosVal"])
 
-    def closePosition(self, position, price, date):
+    def closePositionDF(self, position, price, date):
         """
         Standardised function that takes input of:
             - an open order (dataframe)
@@ -270,19 +327,13 @@ class Backtest_Environment(ABC):
 
         # iterating through each open position
         for position in self.openPositions:
-            # adding up all the units in total units
-            total_units += int(position.Units.values[0])
+
+            # only add up the units of long positions (since short positions have already been sold)
+            if position.PosType.values[0] == "Long":
+                # adding up all the units in total units
+                total_units += int(position.Units.values[0])
 
         return int(total_units)
-
-    def changePositionStatus(self, position):
-        """
-        Turns a position's status from True to False. Is called whenever an open order is closed.
-        """
-
-        position.Status = False
-
-        return position
 
     def removeInactiveOrders(self):
         """
@@ -319,6 +370,25 @@ class Backtest_Environment(ABC):
         tmp_cash = self.cash_available + self.totalUnits() * data.NDOpen.values[0]
 
         return tmp_cash
+
+    def adjust_trailing_stoploss(self, data, position):
+        """
+        This function implements the trailing stoploss when called with inputs of:
+         - data: the current data row in the backtest() for loop
+         - position: the position to adjust
+
+         The functions checks whether the position is long or short and adjusts the stoploss accordingly.
+        """
+
+        if self.trailing_stoploss == True:
+
+            if position.PosType.values[0] == "Long" and data.Price.values[0] > position.EntryPrice.values[0]:
+                position.StopLoss = data.Price.values[0] * (1 - self.stoploss)
+
+            elif position.PosType.values[0] == "Short" and data.Price.values[0] < position.EntryPrice.values[0]:
+                position.StopLoss = data.Price.values[0] * (1 + self.stoploss)
+
+        return position
 
     def check_executions(self, executions):
         """
@@ -595,6 +665,16 @@ class Backtest_Environment(ABC):
         ### STATIC METHODS
 
     @staticmethod
+    def changePositionStatus(position):
+        """
+        Turns a position's status from True to False. Is called whenever an open order is closed.
+        """
+
+        position.Status = False
+
+        return position
+
+    @staticmethod
     def modify_open(data, dist="laplace"):
         """
         This function takes in OHLC data and creates a new column in the data called "Modified Open" which alters the open
@@ -736,3 +816,70 @@ class Backtest_Environment(ABC):
         plt.grid()
 
         return
+
+    def trading_mc(self, N, days_to_simulate, pos_ret_q=0):
+        """
+        This function simulates N Monte Carlo simulations using the historical returns of the trading strategy.
+
+        Inputs:
+        - N: number of simulations
+        - days_to_simulate: number of days to simulate using historical portfolio returns
+        - pos_ret_q: quintile of positive returns that the damping factor is calculated from
+
+        The damping factor is a factor that reduces wins and increases losses by a certain amount. It is set to a quintile of
+        the positive returns in this function. This means 1 - pos_ret_q % of returns perform better than the damping factor and
+        pos_ret_q % of positive returns are completely reduced, alongside all the losses being increased. It is a stress testing
+        factor.
+        """
+
+        # dataframe to store simulations
+        strategy_mc_simuls = pd.DataFrame()
+
+        # calculating returns dataframe
+        returns_df = self.portfolio_time_series.pct_change().dropna()
+
+        # damping factor based on positive returns e.g. reduce all trades by pos_ret_q'th quintile of +ve returns
+        damping_factor = returns_df[returns_df >= 0].quantile(pos_ret_q)[
+            0]  # 1 - pos_ret_q % of +ve trades do better than this
+
+        # look calculates shuffled return series, shuffles it differently each time, takes cumulative product, and sets first value
+        # to the ending value of the strategy, hence simulate "days_to_simulate" # of days from this point using historical strat returns
+        for i in range(0, N):
+            shuffled = returns_df.sample(
+                frac=1 / (len(self.portfolio_time_series) / days_to_simulate))  # shuffles returns
+            shuffled = shuffled + 1  # adds one so a meaningful cumprod can be taken
+            shuffled = shuffled * (1 - damping_factor)  # adds damping factor
+            shuffled.iloc[0] = self.portfolio_time_series.iloc[-1].values[
+                0]  # sets first value of col to cumprod to end portfolio value
+            shuffled_cumprod = shuffled.cumprod()  # cumulative product
+            tmp_df = pd.DataFrame(shuffled_cumprod.values)  # storing one simulation in temporary dataframe
+            strategy_mc_simuls = pd.concat([strategy_mc_simuls, tmp_df], axis=1)  # concatenating dataframes
+
+        # appending simulations to MC class variable
+        self.MC = self.portfolio_time_series.append(strategy_mc_simuls, ignore_index=True)
+
+        return strategy_mc_simuls
+
+    def plot_MC(self, N, days_to_simulate, pos_ret_q=0):
+        """
+        This function plots the MC paths, calculated in self.trading_mc(), added onto the previous year of the strategy's
+        portfolio time series. The inputs are the same as those in self.trading_mc():
+
+        - N: number of simulations
+        - days_to_simulate: number of days to simulate using historical portfolio returns
+        - pos_ret_q: quintile of positive returns that the damping factor is calculated from
+
+        """
+
+        # obtain the simulated paths by calling self.trading_mc()
+        strategy_mc_simuls = self.trading_mc(N, days_to_simulate, pos_ret_q=0)
+
+        # create an axis for the plot and plot the first path up to the end of the actual portfolio cash time series
+        ax = self.MC.iloc[:, 0][:len(self.portfolio_time_series)].plot(figsize=(16, 8), legend=None)
+
+        # plot all the simulated paths
+        self.MC[-len(strategy_mc_simuls):].plot(ax=ax, legend=None)
+        ax.set_xlim(len(self.portfolio_time_series) - 252)
+        ax.set_title("{} Simulated Monte Carlo Strategy Paths".format(N))
+        plt.grid()
+        plt.show()
