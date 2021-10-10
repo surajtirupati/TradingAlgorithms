@@ -8,9 +8,7 @@ from scipy.ndimage.interpolation import shift
 from scipy.stats import laplace
 import scipy.stats as stats
 import warnings
-
 warnings.filterwarnings("ignore")
-
 
 class Backtest_Environment(ABC):
     """
@@ -55,7 +53,7 @@ class Backtest_Environment(ABC):
             self.data["ShortStopLoss"] = self.data["Close"] * (1 + self.stoploss)
 
         else:
-            self.data["StopLoss"] = 0
+            pass
 
     @abstractmethod
     def process(self):
@@ -133,11 +131,22 @@ class Backtest_Environment(ABC):
                         # obtain number of units
                         num_units, pos_type = self.process(data_row)
 
+
+
                         # OPEN a position (market order)
-                        self.openPositions.append(
-                            self.openPositionDF(i, data_row.NDOpen.values[0], num_units, data_row.NDDate.values[0],
-                                                pos_type, data_row.PosTarget.values[0],
-                                                data_row.LongStopLoss.values[0]))
+                        if pos_type == "Long":
+                            self.openPositions.append(
+                                self.openPositionDF(i, data_row.NDOpen.values[0], num_units, data_row.NDDate.values[0],
+                                                    pos_type, data_row.PosTarget.values[0],
+                                                    data_row.LongStopLoss.values[0]))
+
+                        elif pos_type == "Short":
+                            self.openPositions.append(
+                                self.openPositionDF(i, data_row.NDOpen.values[0], num_units, data_row.NDDate.values[0],
+                                                    pos_type, data_row.PosTarget.values[0],
+                                                    data_row.ShortStopLoss.values[0]))
+
+
 
                         # executing the opening of the position - this function alters the self.cash_available variable
                         self.executeOpenPosition(i, data_row, pos_type, num_units)
@@ -382,11 +391,11 @@ class Backtest_Environment(ABC):
 
         if self.trailing_stoploss == True:
 
-            if position.PosType.values[0] == "Long" and data.Price.values[0] > position.EntryPrice.values[0]:
-                position.StopLoss = data.Price.values[0] * (1 - self.stoploss)
+            if position.PosType.values[0] == "Long" and data.Close.values[0] > position.EntryPrice.values[0]:
+                position.StopLoss = data.Close.values[0] * (1 - self.stoploss)
 
-            elif position.PosType.values[0] == "Short" and data.Price.values[0] < position.EntryPrice.values[0]:
-                position.StopLoss = data.Price.values[0] * (1 + self.stoploss)
+            elif position.PosType.values[0] == "Short" and data.Close.values[0] < position.EntryPrice.values[0]:
+                position.StopLoss = data.Close.values[0] * (1 + self.stoploss)
 
         return position
 
