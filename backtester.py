@@ -7,8 +7,10 @@ from datetime import datetime, timedelta
 from scipy.ndimage.interpolation import shift
 from scipy.stats import laplace
 import scipy.stats as stats
+from collections import defaultdict
 import warnings
 warnings.filterwarnings("ignore")
+
 
 class Backtest_Environment(ABC):
     """
@@ -39,6 +41,7 @@ class Backtest_Environment(ABC):
         self.openOrders = list()  # list of open orders (for limit order function)
         self.openPositions = list()  # list of open positions
         self.closedPositions = list()  # list of closed positions
+        self.shortPositionPrices = defaultdict()  # defaultdict to store short position entry prices
         self.pos_size = pos_size
         self.tc = tc  # transaction costs
         self.cooldown = cooldown  # initialising cooldown to 0 so that a trades can occur
@@ -131,8 +134,6 @@ class Backtest_Environment(ABC):
                         # obtain number of units
                         num_units, pos_type = self.process(data_row)
 
-
-
                         # OPEN a position (market order)
                         if pos_type == "Long":
                             self.openPositions.append(
@@ -146,7 +147,8 @@ class Backtest_Environment(ABC):
                                                     pos_type, data_row.PosTarget.values[0],
                                                     data_row.ShortStopLoss.values[0]))
 
-
+                            # short position entry prices stored in this dictionary
+                            self.shortPositionPrices[i] = [data_row.NDOpen.values[0], num_units]
 
                         # executing the opening of the position - this function alters the self.cash_available variable
                         self.executeOpenPosition(i, data_row, pos_type, num_units)
@@ -187,7 +189,7 @@ class Backtest_Environment(ABC):
 
                 # UPDATING CASH
             self.cash_time_series = np.append(self.cash_time_series, self.updatedCash(data_row))
-            self.units_held = np.append(self.units_held, self.totalUnits())
+            self.units_held = np.append(self.units_held, self.totalLongUnits())
 
         # Strategy Statistics: calling the statistics function after the entire test set has been run through
         self.statistics()
@@ -238,13 +240,12 @@ class Backtest_Environment(ABC):
 
         elif pos_type == "Short":
 
-            # increasing the portfolio's cash for short orders
+            # cash is only adjusted for transaction costs for short positions as cash adjustment taken care of in updatedCash() function
             if self.tc >= 1:
-                self.cash_available = self.cash_available + num_units * data.NDOpen.values[0] - self.tc
+                self.cash_available = self.cash_available - self.tc
 
             elif self.tc < 1:
-                self.cash_available = self.cash_available + num_units * data.NDOpen.values[0] - num_units * \
-                                      data.NDOpen.values[0] * self.tc
+                self.cash_available = self.cash_available - (num_units * data.NDOpen.values[0] * self.tc)
 
     def executeClosePosition(self, data, position):
         """
@@ -270,12 +271,17 @@ class Backtest_Environment(ABC):
             # update cash and charge transaction costs for closing position
             if self.tc >= 1:
                 # need to add cash back after absolute transaction costs
-                self.cash_available = self.cash_available - position.Units.values[0] * data.NDOpen.values[0] - self.tc
+                self.cash_available = self.cash_available + position.Units.values[0] * (
+                            position.EntryPrice.values[0] - data.NDOpen.values[0]) - self.tc
 
             elif self.tc < 1:
                 # need to add cash back after % transaction costs
-                self.cash_available = self.cash_available - position.Units.values[0] * data.NDOpen.values[0] - \
+                self.cash_available = self.cash_available + position.Units.values[0] * (
+                            position.EntryPrice.values[0] - data.NDOpen.values[0]) - \
                                       position.Units.values[0] * data.NDOpen.values[0] * self.tc
+
+            # deleting the price from the short position prices (defaultdict used for calculating short position equity changes)
+            del self.shortPositionPrices[position.PosID.values[0]]
 
     def openPositionDF(self, pos_id, price, units, date, pos_type, target_price=None, stoploss=None):
         """
@@ -332,9 +338,9 @@ class Backtest_Environment(ABC):
 
         return position
 
-    def totalUnits(self):
+    def totalLongUnits(self):
         """
-        Function returns total units held in open positions.
+        Function returns total long units held in open positions.
         """
 
         # counter
@@ -345,6 +351,24 @@ class Backtest_Environment(ABC):
 
             # only add up the units of long positions (since short positions have already been sold)
             if position.PosType.values[0] == "Long":
+                # adding up all the units in total units
+                total_units += int(position.Units.values[0])
+
+        return int(total_units)
+
+    def totalShortUnits(self):
+        """
+        Function returns total short units held in open positions.
+        """
+
+        # counter
+        total_units = 0
+
+        # iterating through each open position
+        for position in self.openPositions:
+
+            # only add up the units of long positions (since short positions have already been sold)
+            if position.PosType.values[0] == "Short":
                 # adding up all the units in total units
                 total_units += int(position.Units.values[0])
 
@@ -379,10 +403,27 @@ class Backtest_Environment(ABC):
         Outputs the current cash value of the portfolio by summating the product of the current
         day's close price and the total units held with the available cash after all positions have
         been opened/closed.
+
+        Long positions are accounted for by simplying multiply the total number of long units by the current price since
+        the executeOpenPosition subtracts the value of the long position out of the portfolio - this part of the code simply
+        adds it back in.
+
+        Only the transaction cost however was subtracted for the short position so only the change in the position needs to
+        be calculated. This is done by subtracting the current price from the short position's entry price and multiplying
+        by the number of units. The latter 2 variables are stored in a default dictionary called self.shortPositionPrices
         """
 
         # Calculating current cash value of portfolio
-        tmp_cash = self.cash_available + self.totalUnits() * data.NDOpen.values[0]
+
+        # taking into account all long positions
+        tmp_cash = self.cash_available + (self.totalLongUnits() * data.NDOpen.values[0])
+
+        # calculating the individual changes in the short positions by subtracting the entry price by the current price x units
+        # and summating to get the total change - this is why the num_units need to be saved in the defaultdict
+        short_change = sum([val[1] * (val[0] - data.NDOpen.values[0]) for val in self.shortPositionPrices.values()])
+
+        # adding the short position changes to the temporary cash variable that holds the long position change
+        tmp_cash = tmp_cash + short_change
 
         return tmp_cash
 
@@ -476,9 +517,20 @@ class Backtest_Environment(ABC):
             max_consec_losses = max(max_consec_losses, consec_losses)
             big_loss = min(big_loss, position.CashGainLoss.values[0] if position.WinLoss.values[0] == -1 else int(0))
 
+
+
+            # setting an adjuster value to modify the trade time series based on position type
+            if position["PosType"].values[0] == "Long":
+                pos_time_series = self.data[position.EntryDate.values[0]:position.ExitDate.values[0]]["Open"].values * \
+                                  position.Units.values[0]
+
+            elif position["PosType"].values[0] == "Short":
+                inv_rets = 1 + (-1 *self.data.loc[position.EntryDate.values[0]:position.ExitDate.values[0]]["Open"].pct_change().dropna())
+                inv_rets[0] = self.data[(position.EntryDate-timedelta(days=1)).values[0]:position.ExitDate.values[0]]["Open"][0]
+                pos_time_series = inv_rets.cumprod()
+
             # position specific calculations
-            pos_time_series = self.data[position.EntryDate.values[0]:position.ExitDate.values[0]]["Open"].values * \
-                              position.Units.values[0]
+
             position["Max DD Value"], position["Max DD Return"] = self.__class__.max_dd(pos_time_series)
             position["Holding Time"] = (position.ExitDate[0] - position.EntryDate[0]).days
 
@@ -491,6 +543,8 @@ class Backtest_Environment(ABC):
         net_prof_perc = total_net_prof / init_cap
         exposure = self.calc_exposure(self.positions)
         ann_ret = (1 + net_prof_perc) ** (252 / len(self.data)) - 1
+        sharpe_ratio = self.__class__.sharpe(self.portfolio_time_series.pct_change().dropna().values)
+        sortino_ratio = self.__class__.sortino(self.portfolio_time_series.pct_change().dropna().values)
         trans_costs = self.total_tcost()
         port_max_dd_val, port_max_dd_perc = self.__class__.max_dd(self.cash_time_series)
         one_day_95_var = self.var(self.cash_time_series, 0.95)
@@ -529,7 +583,7 @@ class Backtest_Environment(ABC):
             self.positions["CashGainLoss"] == big_loss].EntryDate)[0].days if losers else 0
 
         columns = ["Initial Capital", "Ending Capital", "Total Profit", "Total Profit Percentage", "Exposure",
-                   "Annual Return", "Transaction Costs", "Portfolio Max DD Value", "Portfolio Max DD Perc",
+                   "Annual Return", "Annual Sharpe Ratio", "Annual Sortino Ratio", "Transaction Costs", "Portfolio Max DD Value", "Portfolio Max DD Perc",
                    "1 Day 95% VAR", "1 Day 95% CVAR", "1 Day 99% VAR", "1 Day 99% CVAR",
                    "Total Trades", "Avg Gain/Loss", "Avg Percentage Gain/Loss", "Avg Bars Held", "Avg Max DD Value",
                    "Avg Max DD Percentage", "Max DD Trade Value", "Max DD Trade Percentage",
@@ -538,8 +592,8 @@ class Backtest_Environment(ABC):
                    "Losers", "Lose Percentage", "Loss Losses", "Avg Lose Profit", "Avg Lose Percentage",
                    "Avg Lose Bars Held", "Max Consecutive Losses", "Biggest Loss", "Biggest Loss Bars Held"]
 
-        self.stats = pd.DataFrame([[init_cap, end_cap, total_net_prof, net_prof_perc, exposure, ann_ret, trans_costs,
-                                    port_max_dd_val, port_max_dd_perc, one_day_95_var, one_day_95_cvar, one_day_99_var,
+        self.stats = pd.DataFrame([[init_cap, end_cap, total_net_prof, net_prof_perc, exposure, ann_ret, sharpe_ratio, sortino_ratio,
+                                    trans_costs, port_max_dd_val, port_max_dd_perc, one_day_95_var, one_day_95_cvar, one_day_99_var,
                                     one_day_99_cvar,
                                     total_trades, avg_amount_ch, avg_perc_ch, avg_bars_held, avg_dd_abs, avg_dd_perc,
                                     max_dd_abs, max_dd_perc,
@@ -567,7 +621,7 @@ class Backtest_Environment(ABC):
         else:
             for position in self.closedPositions:
                 total_tc += (position.EntryPrice.values[0] * position.Units.values[0] * self.tc) + (
-                            position.ExitPrice.values[0] * position.Units.values[0] * self.tc)
+                        position.ExitPrice.values[0] * position.Units.values[0] * self.tc)
 
             for position in self.openPositions:
                 total_tc += (position.EntryPrice.values[0] * position.Units.values[0] * self.tc)
@@ -626,8 +680,8 @@ class Backtest_Environment(ABC):
         # subtracting weekends and setting exposure equal to sum of exposed periods divided by total days between dataset
         # start and end dates with weekends / non-business days subtracted
         exposure = round(np.sum(exp_int) / (
-                    int((self.data.index[-1] - self.data.index[0]).days) - self.__class__.no_weekends(
-                self.data.index[0], self.data.index[-1])), 2)
+                int((self.data.index[-1] - self.data.index[0]).days) - self.__class__.no_weekends(
+            self.data.index[0], self.data.index[-1])), 2)
 
         # return exposure as percentage decimal
         return exposure
@@ -711,7 +765,7 @@ class Backtest_Environment(ABC):
         # generating laplace values
         rvs = getattr(stats, dist).rvs(size=len(raw_perc))  # obtaining the non-scaled variables
         laplace = (rvs - np.min(rvs)) / (np.max(rvs) - np.min(rvs)) * (
-                    r1 - r2) + r2  # scaling laplace values < 1 and -1 >
+                r1 - r2) + r2  # scaling laplace values < 1 and -1 >
 
         # modelling a modified percentage change
         mod_perc = raw_perc * laplace
@@ -773,6 +827,26 @@ class Backtest_Environment(ABC):
         """
         rets = np.delete((shift(pos_time_series, -1) - pos_time_series) / pos_time_series, -1)
         return rets
+
+    @staticmethod
+    def sharpe(returns):
+        """Takes in numpy array of return values of the portfolio and returns the Sharpe ratio."""
+
+        # calculating sharpe
+        sharpe_ratio = np.mean(returns)/np.std(returns)
+
+        return np.round(sharpe_ratio * np.sqrt(252), 3)
+
+    @staticmethod
+    def sortino(returns):
+        """Takes in numpy array of return values of the portfolio and returns the Sortino ratio."""
+
+        # obtaining negative returns only
+        downside_returns = [ret for ret in returns if ret < 0]
+        # calculating sortino
+        sortino = np.mean(returns)/np.std(downside_returns)
+
+        return np.round(sortino * np.sqrt(252), 3)
 
     @staticmethod
     def max_dd(data):
