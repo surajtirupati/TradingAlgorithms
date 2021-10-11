@@ -314,11 +314,17 @@ class Backtest_Environment(ABC):
         method backtest().
         """
 
+        if position["PosType"].values[0] == "Long":
+            adjuster = 1
+
+        elif position["PosType"].values[0] == "Short":
+            adjuster = -1
+
         position["Status"] = False  # updating the position status
         position["ExitPrice"] = price  # exit price
         position["ExitDate"] = date  # exit date
-        position["CashGainLoss"] = position["Units"] * (
-                    position["ExitPrice"] - position["EntryPrice"])  # calculating cash gain/loss
+        position["CashGainLoss"] = adjuster * position["Units"] * (
+                position["ExitPrice"] - position["EntryPrice"])  # calculating cash gain/loss
         position["PercGainPreTC"] = position["CashGainLoss"] / (position["Units"] * position["EntryPrice"])
         position["WinLoss"] = np.sign(position["CashGainLoss"])
 
@@ -505,22 +511,22 @@ class Backtest_Environment(ABC):
         # winner stats
         winners = winners
         win_perc = round(winners / len(self.closedPositions), 2)
-        avg_win_prof = win_prof / winners
-        avg_winner_perc = avg_winner_perc / winners
-        avg_win_bars_held = avg_win_bars_held / winners
+        avg_win_prof = win_prof / winners if winners else 0
+        avg_winner_perc = avg_winner_perc / winners if winners else 0
+        avg_win_bars_held = avg_win_bars_held / winners if winners else 0
         max_consec_wins = max_consec_wins
         big_win_bars_held = (self.positions[self.positions["CashGainLoss"] == big_win].ExitDate - self.positions[
-            self.positions["CashGainLoss"] == big_win].EntryDate)[0].days
+            self.positions["CashGainLoss"] == big_win].EntryDate)[0].days if winners else 0
 
         # loser stats
         losers = losers
         lose_perc = round(losers / len(self.closedPositions), 2)
-        avg_lose_prof = lose_prof / losers
-        avg_loser_perc = avg_loser_perc / losers
-        avg_lose_bars_held = avg_lose_bars_held / losers
+        avg_lose_prof = lose_prof / losers if losers else 0
+        avg_loser_perc = avg_loser_perc / losers if losers else 0
+        avg_lose_bars_held = avg_lose_bars_held / losers if losers else 0
         max_consec_losses = max_consec_losses
         big_loss_bars_held = (self.positions[self.positions["CashGainLoss"] == big_loss].ExitDate - self.positions[
-            self.positions["CashGainLoss"] == big_loss].EntryDate)[0].days
+            self.positions["CashGainLoss"] == big_loss].EntryDate)[0].days if losers else 0
 
         columns = ["Initial Capital", "Ending Capital", "Total Profit", "Total Profit Percentage", "Exposure",
                    "Annual Return", "Transaction Costs", "Portfolio Max DD Value", "Portfolio Max DD Perc",
