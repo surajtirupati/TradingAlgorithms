@@ -1,13 +1,12 @@
 from abc import ABC, abstractmethod
 import pandas as pd
 import numpy as np
-import yfinance as yf
 import matplotlib.pyplot as plt
-from datetime import datetime, timedelta
+from datetime import timedelta
 from scipy.ndimage.interpolation import shift
-from scipy.stats import laplace
 import scipy.stats as stats
 from collections import defaultdict
+import operator
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -29,8 +28,9 @@ class Backtest_Environment(ABC):
     """
 
     def __init__(self, data, start_cash, pos_size, tc, cooldown=1, max_executions=None, max_execution_period=None,
-                 cash_buffer=0, stoploss=None, trailing_stoploss=False):
+                 cash_buffer=0, stoploss=None, trailing_stoploss=False, custom_stoploss=False, add_open_noise = False):
         self.data = data  # storing the data as a class variable
+        self.add_open_noise = add_open_noise # add open noise boolean - if true it adds scaled noise to next day open
         self.data = self.format_data(data)  # modifying the data to include columns NDOpen and NDDate
         self.start_cash = int(start_cash)  # storing a specific variable for starting cash
         self.cash_available = start_cash  # storing starting cash in a constantly updated variable
@@ -49,14 +49,8 @@ class Backtest_Environment(ABC):
         self.max_execution_period = max_execution_period  # maximum execution period
         self.stoploss = stoploss  # setting the stoploss
         self.trailing_stoploss = trailing_stoploss  # trailing stoploss boolean
+        self.custom_stoploss = custom_stoploss  # custom stoploss boolean
 
-        # adding the stoploss to the data
-        if self.stoploss is not None:
-            self.data["LongStopLoss"] = self.data["Close"] * (1 - self.stoploss)
-            self.data["ShortStopLoss"] = self.data["Close"] * (1 + self.stoploss)
-
-        else:
-            pass
 
     @abstractmethod
     def process(self):
@@ -139,13 +133,13 @@ class Backtest_Environment(ABC):
                             self.openPositions.append(
                                 self.openPositionDF(i, data_row.NDOpen.values[0], num_units, data_row.NDDate.values[0],
                                                     pos_type, data_row.PosTarget.values[0],
-                                                    data_row.LongStopLoss.values[0]))
+                                                    self.gen_stoploss(data_row, pos_type)))
 
                         elif pos_type == "Short":
                             self.openPositions.append(
                                 self.openPositionDF(i, data_row.NDOpen.values[0], num_units, data_row.NDDate.values[0],
                                                     pos_type, data_row.PosTarget.values[0],
-                                                    data_row.ShortStopLoss.values[0]))
+                                                    self.gen_stoploss(data_row, pos_type)))
 
                             # short position entry prices stored in this dictionary
                             self.shortPositionPrices[i] = [data_row.NDOpen.values[0], num_units]
@@ -209,8 +203,15 @@ class Backtest_Environment(ABC):
 
         # STRATEGY AGNOSTIC COLUMNS
         nddate = self.data.index.values[1:]  # tmp array for next day dates
-        self.data["NDOpen"] = self.modify_open(data).shift(
-            -1)  # next day open: the price on which trade decisions made at the prev close are taken - with a laplacian perturbation added using self.modify_open()
+
+        # check if add open noise bool is true
+        if self.add_open_noise == True:
+            self.data["NDOpen"] = self.modify_open(data).shift(-1)  # next day open: the price on which trade decisions made at the prev close are taken - with a laplacian perturbation added using self.modify_open()
+
+        # if its false (default setting) - don't add noise
+        else:
+            self.data["NDOpen"] = self.data.Open.shift(-1)
+
         self.data = self.data.dropna()  # dropping nan to make space for date[1:] values converted into datetime values
         self.data["NDDate"] = pd.to_datetime(
             nddate)  # next day date: the date on which trade decisions made at prev close are taken
@@ -272,12 +273,12 @@ class Backtest_Environment(ABC):
             if self.tc >= 1:
                 # need to add cash back after absolute transaction costs
                 self.cash_available = self.cash_available + position.Units.values[0] * (
-                            position.EntryPrice.values[0] - data.NDOpen.values[0]) - self.tc
+                        position.EntryPrice.values[0] - data.NDOpen.values[0]) - self.tc
 
             elif self.tc < 1:
                 # need to add cash back after % transaction costs
                 self.cash_available = self.cash_available + position.Units.values[0] * (
-                            position.EntryPrice.values[0] - data.NDOpen.values[0]) - \
+                        position.EntryPrice.values[0] - data.NDOpen.values[0]) - \
                                       position.Units.values[0] * data.NDOpen.values[0] * self.tc
 
             # deleting the price from the short position prices (defaultdict used for calculating short position equity changes)
@@ -373,6 +374,26 @@ class Backtest_Environment(ABC):
                 total_units += int(position.Units.values[0])
 
         return int(total_units)
+
+    def gen_stoploss(self, data, pos_type):
+        """
+        Generates a stoploss depending on whether stoploss is active and position type.
+        Strategies with a custom stoploss MUST have an input data column called "StopLoss"
+        """
+
+        if self.stoploss is not None and self.custom_stoploss is False:
+
+            if pos_type == "Long":
+                return data.Close.values[0] * operator.sub(1, self.stoploss)
+
+            elif pos_type == "Short":
+                return data.Close.values[0] * operator.sub(1, self.stoploss)
+
+        if self.custom_stoploss is True:
+            return data["StopLoss"].values[0]
+
+        else:
+            return 0
 
     def removeInactiveOrders(self):
         """
@@ -517,16 +538,16 @@ class Backtest_Environment(ABC):
             max_consec_losses = max(max_consec_losses, consec_losses)
             big_loss = min(big_loss, position.CashGainLoss.values[0] if position.WinLoss.values[0] == -1 else int(0))
 
-
-
             # setting an adjuster value to modify the trade time series based on position type
             if position["PosType"].values[0] == "Long":
                 pos_time_series = self.data[position.EntryDate.values[0]:position.ExitDate.values[0]]["Open"].values * \
                                   position.Units.values[0]
 
             elif position["PosType"].values[0] == "Short":
-                inv_rets = 1 + (-1 *self.data.loc[position.EntryDate.values[0]:position.ExitDate.values[0]]["Open"].pct_change().dropna())
-                inv_rets[0] = self.data[(position.EntryDate-timedelta(days=1)).values[0]:position.ExitDate.values[0]]["Open"][0]
+                inv_rets = 1 + (-1 * self.data.loc[position.EntryDate.values[0]:position.ExitDate.values[0]][
+                    "Open"].pct_change().dropna())
+                inv_rets[0] = \
+                self.data[(position.EntryDate - timedelta(days=1)).values[0]:position.ExitDate.values[0]]["Open"][0]
                 pos_time_series = inv_rets.cumprod()
 
             # position specific calculations
@@ -583,7 +604,8 @@ class Backtest_Environment(ABC):
             self.positions["CashGainLoss"] == big_loss].EntryDate)[0].days if losers else 0
 
         columns = ["Initial Capital", "Ending Capital", "Total Profit", "Total Profit Percentage", "Exposure",
-                   "Annual Return", "Annual Sharpe Ratio", "Annual Sortino Ratio", "Transaction Costs", "Portfolio Max DD Value", "Portfolio Max DD Perc",
+                   "Annual Return", "Annual Sharpe Ratio", "Annual Sortino Ratio", "Transaction Costs",
+                   "Portfolio Max DD Value", "Portfolio Max DD Perc",
                    "1 Day 95% VAR", "1 Day 95% CVAR", "1 Day 99% VAR", "1 Day 99% CVAR",
                    "Total Trades", "Avg Gain/Loss", "Avg Percentage Gain/Loss", "Avg Bars Held", "Avg Max DD Value",
                    "Avg Max DD Percentage", "Max DD Trade Value", "Max DD Trade Percentage",
@@ -592,16 +614,17 @@ class Backtest_Environment(ABC):
                    "Losers", "Lose Percentage", "Loss Losses", "Avg Lose Profit", "Avg Lose Percentage",
                    "Avg Lose Bars Held", "Max Consecutive Losses", "Biggest Loss", "Biggest Loss Bars Held"]
 
-        self.stats = pd.DataFrame([[init_cap, end_cap, total_net_prof, net_prof_perc, exposure, ann_ret, sharpe_ratio, sortino_ratio,
-                                    trans_costs, port_max_dd_val, port_max_dd_perc, one_day_95_var, one_day_95_cvar, one_day_99_var,
-                                    one_day_99_cvar,
-                                    total_trades, avg_amount_ch, avg_perc_ch, avg_bars_held, avg_dd_abs, avg_dd_perc,
-                                    max_dd_abs, max_dd_perc,
-                                    winners, win_perc, win_prof, avg_win_prof, avg_winner_perc, avg_win_bars_held,
-                                    max_consec_wins, big_win, big_win_bars_held,
-                                    losers, lose_perc, lose_prof, avg_lose_prof, avg_loser_perc, avg_lose_bars_held,
-                                    max_consec_losses, big_loss, big_loss_bars_held]],
-                                  columns=columns)
+        self.stats = pd.DataFrame(
+            [[init_cap, end_cap, total_net_prof, net_prof_perc, exposure, ann_ret, sharpe_ratio, sortino_ratio,
+              trans_costs, port_max_dd_val, port_max_dd_perc, one_day_95_var, one_day_95_cvar, one_day_99_var,
+              one_day_99_cvar,
+              total_trades, avg_amount_ch, avg_perc_ch, avg_bars_held, avg_dd_abs, avg_dd_perc,
+              max_dd_abs, max_dd_perc,
+              winners, win_perc, win_prof, avg_win_prof, avg_winner_perc, avg_win_bars_held,
+              max_consec_wins, big_win, big_win_bars_held,
+              losers, lose_perc, lose_prof, avg_lose_prof, avg_loser_perc, avg_lose_bars_held,
+              max_consec_losses, big_loss, big_loss_bars_held]],
+            columns=columns)
 
         return
 
@@ -833,7 +856,7 @@ class Backtest_Environment(ABC):
         """Takes in numpy array of return values of the portfolio and returns the Sharpe ratio."""
 
         # calculating sharpe
-        sharpe_ratio = np.mean(returns)/np.std(returns)
+        sharpe_ratio = np.mean(returns) / np.std(returns)
 
         return np.round(sharpe_ratio * np.sqrt(252), 3)
 
@@ -844,7 +867,7 @@ class Backtest_Environment(ABC):
         # obtaining negative returns only
         downside_returns = [ret for ret in returns if ret < 0]
         # calculating sortino
-        sortino = np.mean(returns)/np.std(downside_returns)
+        sortino = np.mean(returns) / np.std(downside_returns)
 
         return np.round(sortino * np.sqrt(252), 3)
 
