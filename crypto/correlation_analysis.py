@@ -4,6 +4,8 @@ import numpy as np
 from scipy.optimize import curve_fit
 from yfinance import Ticker
 
+# vs code example
+
 def get_data(ticker):
     """
     Inputs:
